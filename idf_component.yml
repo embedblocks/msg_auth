@@ -1,0 +1,30 @@
+dependencies:
+  idf: '>=6.0,<6.1'
+description: 'Per-message authentication for ESP-IDF v6.0.x with a pre-shared installation
+  key. Wraps a message in a 28-byte envelope (sender, receiver, epoch, counter, 128-bit
+  HMAC-SHA256 tag) and rejects forged, altered, misaddressed and replayed messages.
+  Pure logic on bytes: works over UDP, UART, BLE or anything else. PSA Crypto only, no
+  encryption, no tasks, no allocations after create.
+
+  '
+files:
+  exclude:
+  - .git/**/*
+  - host_test/**/*
+  - '**/build/**/*'
+  - dist/**/*
+  - MSG_AUTH_SPEC.md
+  use_gitignore: true
+tags:
+- authentication
+- hmac
+- hkdf
+- psa
+- mbedtls
+- security
+- replay-protection
+- psk
+- message
+- integrity
+url: https://github.com/embedblocks/msg_auth.git
+version: 0.1.0

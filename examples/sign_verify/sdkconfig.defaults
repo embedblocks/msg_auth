@@ -1,0 +1,6 @@
+# msg_auth uses one PSA key from several tasks in real applications (default: y)
+CONFIG_MBEDTLS_THREADING_C=y
+# HMAC-SHA256 and HKDF-SHA256 need SHA-256 (default: y)
+CONFIG_MBEDTLS_SHA256_C=y
+# The example keeps its 1460-byte buffers static; this leaves room for logging
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096

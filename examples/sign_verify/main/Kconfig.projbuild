@@ -1,0 +1,11 @@
+menu "msg_auth sign_verify example"
+
+    config EXAMPLE_PSK_HEX
+        string "Installation key, hex (INSECURE example value)"
+        default "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+        help
+            32 to 128 hex digits (16 to 64 bytes). This value is public: it is
+            for the example only. A real installation provisions its own random
+            key and stores it protected (NVS encryption, flash encryption).
+
+endmenu
