@@ -10,3 +10,4 @@ graveyard/
 dependencies.lock
 *.zip
 host_test/out/
+out/
