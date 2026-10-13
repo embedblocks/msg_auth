@@ -1,0 +1,12 @@
+.vscode/
+build/
+build-*/
+dist/
+.github/
+managed_components/
+sdkconfig
+sdkconfig.old
+graveyard/
+dependencies.lock
+*.zip
+host_test/out/
