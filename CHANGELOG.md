@@ -6,6 +6,58 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 
+## [0.2.0] - 2026-10-14
+
+Additive release: `msg_auth_verify()` and every 0.1.0 behaviour are unchanged.
+
+### Added
+- `msg_auth_verify_from()`: verification for callers that know the only
+  acceptable sender (e.g. one peer per link). Any other sender is rejected
+  with the new `ESP_ERR_MSG_AUTH_WRONG_SENDER` before the tag is checked,
+  without touching that sender's freshness state or per-peer statistics.
+  Fixes the cross-link case where a genuine envelope relayed onto the wrong
+  link advanced its sender's state and caused the real copy to be rejected
+  as a replay. An invalid `expected_sender` is `ESP_ERR_INVALID_ARG`
+  whatever the envelope contains. Outputs are written only on `ESP_OK`.
+- `msg_auth_rx_info_t`: the verified `(epoch, counter)` of an accepted
+  envelope, returned by `msg_auth_verify_from()`, for event identity.
+- `msg_auth_get_stats()` and `msg_auth_stats_t`: context-wide
+  `bad_tag_total` and `wrong_sender` counters.
+- `msg_auth_err_to_name()` names `ESP_ERR_MSG_AUTH_WRONG_SENDER`.
+- Host tests T26–T33: right and wrong sender, the cross-link scenario,
+  check order, argument checks and untouched outputs, bit flips, injected
+  crypto failure, context statistics and concurrency through
+  `msg_auth_verify_from()`. T1–T25 unchanged.
+- `examples/sign_verify`: node C, `verify_from` scenarios including a
+  relayed envelope on the wrong link, and `target_checks.c`, which measures
+  every `MSG_AUTH_SPEC.md` §9.3 row (MAC path, HMAC driver, concurrency on
+  one key ID, `psa_crypto_init`, heap at create and per call, stack per
+  call, latency at 0/64/512/1432 bytes) and prints it as one block.
+
+### Changed
+- Steps 1–7 of verification are one internal function shared by both
+  entry points.
+- Per-peer `bad_tag` is documented as tag failures *claiming* that sender
+  (the ID is unauthenticated); `bad_tag_total` is the reliable count.
+
+### Documentation
+- `MSG_AUTH_SPEC.md`: §1 points to `verify_from`; new §5.4a and §5.8; §5.7
+  seven codes; §6.3 event identity from `info.epoch`; §7 concurrency table;
+  §7 memory notes PSA's per-call heap use; §9.3 names the HMAC driver
+  actually used (ESP's transparent HMAC driver on the SHA accelerator, not
+  the eFuse-key HMAC peripheral) and records ESP32 QEMU results; §10 tests
+  T26–T33; §11 example; §12 open point 2 resolved.
+- README: `verify_from` usage, results table, statistics, chip status.
+
+### Verified
+- Host: T1–T33 pass on both MAC paths with ASan/UBSan (TF-PSA-Crypto from
+  Mbed TLS 4.0.0).
+- ESP-IDF v6.0.3: example builds without warnings for ESP32 (both MAC
+  paths) and ESP32-S3, and passes 27/27 in Espressif's QEMU (ESP32) on both
+  paths. Hardware latency and the hardware §9.3 record are still to be
+  recorded.
+
+
 ## [0.1.0] - 2026-10-12
 
 ### Added

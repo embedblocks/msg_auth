@@ -1,5 +1,7 @@
 /*
- * msg_auth host tests: T1–T25 of MSG_AUTH_SPEC.md §10, plus the pure functions.
+ * msg_auth host tests: T1–T33 of MSG_AUTH_SPEC.md §10, plus the pure functions.
+ * T1–T25 are unchanged from 0.1.0; T26–T33 cover msg_auth_verify_from() and
+ * msg_auth_get_stats() (0.2.0).
  *
  * Runs msg_auth.c unchanged against the real PSA Crypto library (TF-PSA-Crypto,
  * as shipped in Mbed TLS 4.x), with FreeRTOS mapped onto pthreads and fault
@@ -684,14 +686,25 @@ typedef struct {
     int               count;
     esp_err_t         result;      /* T24 */
     uint32_t         *counters;    /* T23 */
+    bool              use_from;    /* T33: go through msg_auth_verify_from(expected) */
+    uint8_t           expected;
 } job_t;
+
+static esp_err_t job_verify(const job_t *j, const env_t *e)
+{
+    if (!j->use_from) {
+        return verify(j->h, e);
+    }
+    const void *m; size_t n;
+    return msg_auth_verify_from(j->h, j->expected, e->buf, e->len, &m, &n, NULL);
+}
 
 static void *verify_bad_job(void *arg)
 {
     job_t *j = arg;
     pthread_barrier_wait(&s_barrier);
     for (int i = 0; i < j->count; i++) {
-        if (verify(j->h, &j->envs[i]) != ESP_ERR_MSG_AUTH_BAD_TAG) {
+        if (job_verify(j, &j->envs[i]) != ESP_ERR_MSG_AUTH_BAD_TAG) {
             j->result = ESP_FAIL;
         }
     }
@@ -767,7 +780,7 @@ static void *verify_one_job(void *arg)
 {
     job_t *j = arg;
     pthread_barrier_wait(&s_barrier);
-    j->result = verify(j->h, j->envs);
+    j->result = job_verify(j, j->envs);
     return NULL;
 }
 
@@ -812,6 +825,368 @@ TEST(t25_receiver_restart)
     msg_auth_delete(a); msg_auth_delete(b);
 }
 
+/* ================= T26–T33: msg_auth_verify_from, context stats (0.2.0) ================= */
+
+#define ID_C     2                   /* a receiver with two peers, A and B */
+
+static msg_auth_stats_t ctx_stats(msg_auth_handle_t h)
+{
+    msg_auth_stats_t s;
+    if (msg_auth_get_stats(h, &s) != ESP_OK) abort();
+    return s;
+}
+
+static esp_err_t verify_from(msg_auth_handle_t h, uint8_t expected, const env_t *e)
+{
+    const void *m; size_t n;
+    return msg_auth_verify_from(h, expected, e->buf, e->len, &m, &n, NULL);
+}
+
+static bool peer_stats_equal(msg_auth_peer_stats_t x, msg_auth_peer_stats_t y)
+{
+    return x.accepted == y.accepted && x.bad_tag == y.bad_tag && x.replay == y.replay &&
+           x.last_epoch == y.last_epoch && x.last_counter == y.last_counter && x.seen == y.seen;
+}
+
+/* T26 (review T-a, T-e): right sender gives the same result, message and stats
+ * as msg_auth_verify(); info holds the envelope's freshness pair; info may be NULL. */
+TEST(t26_verify_from_right_sender)
+{
+    msg_auth_handle_t a  = make(ID_A, 9);
+    msg_auth_handle_t r1 = make(ID_C, 1), r2 = make(ID_C, 1);   /* identical receivers */
+    msg_auth_test_set_counter(a, 0x10203040);
+    const size_t lens[] = {0, 5, MSG_AUTH_MAX_MESSAGE};
+    static uint8_t msg[MSG_AUTH_MAX_MESSAGE];
+    for (size_t i = 0; i < sizeof msg; i++) msg[i] = (uint8_t)(i * 11 + 1);
+    for (size_t i = 0; i < 3; i++) {
+        env_t e = sign(a, ID_C, lens[i] ? msg : NULL, lens[i]);
+        uint8_t s; const void *m1, *m2; size_t n1, n2;
+        msg_auth_rx_info_t info = { 0xEEEEEEEE, 0xEEEEEEEE };
+        CHECK_ERR(msg_auth_verify(r1, e.buf, e.len, &s, &m1, &n1), ESP_OK);
+        CHECK_ERR(msg_auth_verify_from(r2, ID_A, e.buf, e.len, &m2, &n2,
+                                       i == 1 ? NULL : &info), ESP_OK);     /* T-e */
+        CHECK(m1 == m2 && n1 == n2 && n2 == lens[i]);
+        CHECK(m2 == e.buf + MSG_AUTH_HEADER_SIZE);
+        if (i != 1) {
+            CHECK(info.epoch == 9 && info.counter == env_counter(&e));
+        }
+        /* and the same replay result */
+        CHECK_ERR(msg_auth_verify(r1, e.buf, e.len, &s, &m1, &n1), ESP_ERR_MSG_AUTH_REPLAY);
+        CHECK_ERR(verify_from(r2, ID_A, &e), ESP_ERR_MSG_AUTH_REPLAY);
+    }
+    CHECK(peer_stats_equal(stats(r1, ID_A), stats(r2, ID_A)));
+    CHECK(stats(r2, ID_A).accepted == 3 && stats(r2, ID_A).replay == 3);
+    msg_auth_delete(a); msg_auth_delete(r1); msg_auth_delete(r2);
+}
+
+/* T27 (review T-b): the cross-link scenario. B's genuine envelope relayed onto A's
+ * link is rejected without touching B's state, and B's own copy is then accepted.
+ * The second half documents the 0.1.0 behaviour that verify_from removes. */
+TEST(t27_cross_link)
+{
+    msg_auth_handle_t b = make(ID_B, 1), r = make(ID_C, 1);
+    env_t first = sign(b, ID_C, "b0", 2);
+    CHECK_ERR(verify_from(r, ID_B, &first), ESP_OK);            /* B's state exists */
+    const msg_auth_peer_stats_t b0 = stats(r, ID_B), a0 = stats(r, ID_A);
+
+    env_t e = sign(b, ID_C, "b1", 2);
+    long calls = shim_mac_calls();
+    const void *m = (const void *)0x1; size_t n = 77;
+    msg_auth_rx_info_t info = { 0xEEEEEEEE, 0xEEEEEEEE };
+    CHECK_ERR(msg_auth_verify_from(r, ID_A, e.buf, e.len, &m, &n, &info),
+              ESP_ERR_MSG_AUTH_WRONG_SENDER);
+    CHECK(shim_mac_calls() == calls);                           /* before any MAC */
+    CHECK(m == (const void *)0x1 && n == 77 && info.epoch == 0xEEEEEEEE);
+    CHECK(peer_stats_equal(stats(r, ID_B), b0));                /* B untouched */
+    CHECK(peer_stats_equal(stats(r, ID_A), a0));                /* A untouched */
+    CHECK(ctx_stats(r).wrong_sender == 1 && ctx_stats(r).bad_tag_total == 0);
+    CHECK_ERR(verify_from(r, ID_B, &e), ESP_OK);                /* B's own copy accepted */
+
+    /* 0.1.0 shape, for contrast: verify + caller-side check consumes B's message */
+    msg_auth_handle_t r_old = make(ID_C, 1);
+    env_t e2 = sign(b, ID_C, "b2", 2);
+    uint8_t s;
+    CHECK_ERR(msg_auth_verify(r_old, e2.buf, e2.len, &s, &m, &n), ESP_OK);
+    CHECK(s == ID_B);                                           /* caller drops: not ID_A */
+    CHECK_ERR(verify(r_old, &e2), ESP_ERR_MSG_AUTH_REPLAY);     /* B's own copy lost */
+    msg_auth_delete(b); msg_auth_delete(r); msg_auth_delete(r_old);
+}
+
+/* T28 (review T-c): WRONG_SENDER takes priority over a bad tag; nobody's bad_tag moves. */
+TEST(t28_wrong_sender_before_tag)
+{
+    msg_auth_handle_t b = make(ID_B, 1), r = make(ID_C, 1);
+    env_t forged = sign(b, ID_C, "x", 1);
+    forged.buf[forged.len - 1] ^= 0x01;                         /* claims B, bad tag */
+    CHECK_ERR(verify_from(r, ID_A, &forged), ESP_ERR_MSG_AUTH_WRONG_SENDER);
+    CHECK(stats(r, ID_A).bad_tag == 0 && stats(r, ID_B).bad_tag == 0);
+    CHECK(ctx_stats(r).bad_tag_total == 0 && ctx_stats(r).wrong_sender == 1);
+    /* on the right link the same forgery is a bad tag, charged as a claim */
+    CHECK_ERR(verify_from(r, ID_B, &forged), ESP_ERR_MSG_AUTH_BAD_TAG);
+    CHECK(stats(r, ID_B).bad_tag == 1 && ctx_stats(r).bad_tag_total == 1);
+    msg_auth_delete(b); msg_auth_delete(r);
+}
+
+/* T29 (review T-d + T15 for verify_from): argument checks in step 0, whatever the
+ * envelope; outputs (msg, msg_len, info) untouched on every failure path. */
+TEST(t29_verify_from_arguments_and_outputs)
+{
+    msg_auth_handle_t a = make(ID_A, 1), r = make(ID_C, 1);
+    env_t e = sign(a, ID_C, "x", 1);
+    const void *m = (const void *)0x1; size_t n = 77;
+    msg_auth_rx_info_t info = { 0xEEEEEEEE, 0xDDDDDDDD };
+#define UNTOUCHED (m == (const void *)0x1 && n == 77 && \
+                   info.epoch == 0xEEEEEEEE && info.counter == 0xDDDDDDDD)
+
+    /* invalid expected_sender: own ID, above max, 255; with a good, a short and an
+     * oversized envelope, INVALID_ARG every time (step 0, envelope not read) */
+    const uint8_t bad_ids[] = { ID_C, MAX_ID + 1, 255 };
+    const size_t  lens[]    = { e.len, 0, 5, MSG_AUTH_MAX_ENVELOPE + 1 };
+    long calls = shim_mac_calls();
+    for (size_t i = 0; i < sizeof bad_ids; i++) {
+        for (size_t j = 0; j < 4; j++) {
+            CHECK_ERR(msg_auth_verify_from(r, bad_ids[i], e.buf, lens[j], &m, &n, &info),
+                      ESP_ERR_INVALID_ARG);
+        }
+    }
+    CHECK(shim_mac_calls() == calls);
+    /* null arguments */
+    CHECK_ERR(msg_auth_verify_from(NULL, ID_A, e.buf, e.len, &m, &n, &info), ESP_ERR_INVALID_ARG);
+    CHECK_ERR(msg_auth_verify_from(r, ID_A, NULL, e.len, &m, &n, &info),     ESP_ERR_INVALID_ARG);
+    CHECK_ERR(msg_auth_verify_from(r, ID_A, e.buf, e.len, NULL, &n, &info),  ESP_ERR_INVALID_ARG);
+    CHECK_ERR(msg_auth_verify_from(r, ID_A, e.buf, e.len, &m, NULL, &info),  ESP_ERR_INVALID_ARG);
+    CHECK(UNTOUCHED);
+    /* the highest valid ID passes step 0 (ID_A is used below) */
+    msg_auth_handle_t r3 = make(ID_C, 1);
+    env_t e3 = craft(hkdf_k32_status, 1, 1, MAX_ID, ID_C, 1, 0, "x", 1);   /* wrong key: fine */
+    CHECK_ERR(msg_auth_verify_from(r3, MAX_ID, e3.buf, e3.len, &m, &n, &info),
+              ESP_ERR_MSG_AUTH_BAD_TAG);                                    /* got past step 0 */
+    msg_auth_delete(r3);
+
+    /* every rejection after step 0 leaves the outputs alone */
+    env_t big = e;   big.len = MSG_AUTH_MAX_ENVELOPE + 1;
+    env_t shrt = e;  shrt.len = MSG_AUTH_OVERHEAD - 1;
+    env_t nfm  = sign(a, ID_B, "x", 1);
+    env_t bad  = e;  bad.buf[bad.len - 1] ^= 0x80;
+    env_t own  = e;  own.buf[2] = ID_C;       /* claims the receiver's own ID */
+    msg_auth_handle_t bb = make(ID_B, 1);
+    env_t wrong = sign(bb, ID_C, "x", 1);
+    struct { const env_t *env; esp_err_t want; } cases[] = {
+        { &big,   ESP_ERR_INVALID_SIZE },
+        { &shrt,  ESP_ERR_MSG_AUTH_MALFORMED },
+        { &nfm,   ESP_ERR_MSG_AUTH_NOT_FOR_ME },
+        { &own,   ESP_ERR_MSG_AUTH_UNKNOWN },
+        { &wrong, ESP_ERR_MSG_AUTH_WRONG_SENDER },
+        { &bad,   ESP_ERR_MSG_AUTH_BAD_TAG },
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        CHECK_ERR(msg_auth_verify_from(r, ID_A, cases[i].env->buf, cases[i].env->len,
+                                       &m, &n, &info), cases[i].want);
+        CHECK(UNTOUCHED);
+    }
+    CHECK_ERR(verify_from(r, ID_A, &e), ESP_OK);
+    CHECK_ERR(msg_auth_verify_from(r, ID_A, e.buf, e.len, &m, &n, &info), ESP_ERR_MSG_AUTH_REPLAY);
+    CHECK(UNTOUCHED);
+#undef UNTOUCHED
+
+    /* get_stats and the new error name */
+    msg_auth_stats_t st;
+    CHECK_ERR(msg_auth_get_stats(NULL, &st), ESP_ERR_INVALID_ARG);
+    CHECK_ERR(msg_auth_get_stats(r, NULL), ESP_ERR_INVALID_ARG);
+    CHECK(strcmp(msg_auth_err_to_name(ESP_ERR_MSG_AUTH_WRONG_SENDER),
+                 "ESP_ERR_MSG_AUTH_WRONG_SENDER") == 0);
+    msg_auth_delete(a); msg_auth_delete(bb); msg_auth_delete(r);
+}
+
+/* T30 (T2 through verify_from): every single-bit flip gives the first check it
+ * reaches; a sender byte flipped to another valid peer gives WRONG_SENDER. */
+TEST(t30_verify_from_bit_flips)
+{
+    msg_auth_handle_t a = make(ID_A, 1), r = make(ID_C, 1);
+    const char msg[] = "flip me";
+    env_t e = sign(a, ID_C, msg, sizeof msg);
+    uint32_t want_bad = 0, want_wrong = 0;
+    for (size_t off = 0; off < e.len; off++) {
+        for (int bit = 0; bit < 8; bit++) {
+            env_t f = e;
+            f.buf[off] ^= (uint8_t)(1u << bit);
+            esp_err_t want = ESP_ERR_MSG_AUTH_BAD_TAG;
+            if (off == 0 || off == 1) {
+                want = ESP_ERR_MSG_AUTH_MALFORMED;
+            } else if (off == 3) {
+                want = ESP_ERR_MSG_AUTH_NOT_FOR_ME;
+            } else if (off == 2 && (f.buf[2] > MAX_ID || f.buf[2] == ID_C)) {
+                want = ESP_ERR_MSG_AUTH_UNKNOWN;                /* step 4 runs before 4a */
+            } else if (off == 2) {
+                want = ESP_ERR_MSG_AUTH_WRONG_SENDER;           /* another valid peer */
+            }
+            want_bad   += want == ESP_ERR_MSG_AUTH_BAD_TAG;
+            want_wrong += want == ESP_ERR_MSG_AUTH_WRONG_SENDER;
+            CHECK_ERR(verify_from(r, ID_A, &f), want);
+        }
+    }
+    CHECK(want_wrong > 0);
+    CHECK(ctx_stats(r).bad_tag_total == want_bad && ctx_stats(r).wrong_sender == want_wrong);
+    CHECK(stats(r, ID_A).bad_tag == want_bad);                  /* all claimed A */
+    CHECK(stats(r, ID_B).bad_tag == 0 && stats(r, MAX_ID).bad_tag == 0);
+    CHECK_ERR(verify_from(r, ID_A, &e), ESP_OK);                /* freshness untouched */
+    msg_auth_delete(a); msg_auth_delete(r);
+}
+
+/* T31 (T20 through verify_from): crypto failure is ESP_FAIL, no stats, no state. */
+TEST(t31_verify_from_crypto_failure)
+{
+    msg_auth_handle_t a = make(ID_A, 1), r = make(ID_C, 1);
+    env_t e = sign(a, ID_C, "x", 1);
+    const void *m = (const void *)0x1; size_t n = 77;
+    msg_auth_rx_info_t info = { 0xEEEEEEEE, 0xEEEEEEEE };
+    shim_faults.mac = true;
+    CHECK_ERR(msg_auth_verify_from(r, ID_A, e.buf, e.len, &m, &n, &info), ESP_FAIL);
+    shim_faults.mac = false;
+    CHECK(m == (const void *)0x1 && n == 77 && info.epoch == 0xEEEEEEEE);
+    msg_auth_peer_stats_t st = stats(r, ID_A);
+    CHECK(st.bad_tag == 0 && st.seen == 0 && st.accepted == 0);
+    CHECK(ctx_stats(r).bad_tag_total == 0 && ctx_stats(r).wrong_sender == 0);
+    CHECK_ERR(verify_from(r, ID_A, &e), ESP_OK);
+    env_t e2 = sign(a, ID_C, "y", 1);
+    shim_faults.mac = true;
+    CHECK_ERR(verify_from(r, ID_A, &e2), ESP_FAIL);
+    shim_faults.mac = false;
+    st = stats(r, ID_A);
+    CHECK(st.last_counter == 0 && st.accepted == 1 && st.bad_tag == 0);
+    CHECK_ERR(verify_from(r, ID_A, &e2), ESP_OK);
+    msg_auth_delete(a); msg_auth_delete(r);
+}
+
+/* T32: context-wide counters. bad_tag_total counts BAD_TAG from both entry points
+ * whatever sender is claimed; REPLAY, NOT_FOR_ME etc. do not count. */
+TEST(t32_context_stats)
+{
+    msg_auth_handle_t a = make(ID_A, 1), b = make(ID_B, 1), r = make(ID_C, 1);
+    msg_auth_stats_t st;
+    memset(&st, 0xAA, sizeof st);
+    CHECK_ERR(msg_auth_get_stats(r, &st), ESP_OK);
+    CHECK(st.bad_tag_total == 0 && st.wrong_sender == 0);
+    env_t ea = sign(a, ID_C, "a", 1), eb = sign(b, ID_C, "b", 1);
+    env_t ba = ea; ba.buf[ba.len - 1] ^= 1;
+    env_t bb = eb; bb.buf[bb.len - 1] ^= 1;
+    CHECK_ERR(verify(r, &ba), ESP_ERR_MSG_AUTH_BAD_TAG);
+    CHECK_ERR(verify_from(r, ID_B, &bb), ESP_ERR_MSG_AUTH_BAD_TAG);
+    CHECK_ERR(verify_from(r, ID_A, &eb), ESP_ERR_MSG_AUTH_WRONG_SENDER);
+    CHECK_ERR(verify_from(r, ID_B, &ea), ESP_ERR_MSG_AUTH_WRONG_SENDER);
+    CHECK_ERR(verify(r, &ea), ESP_OK);
+    CHECK_ERR(verify(r, &ea), ESP_ERR_MSG_AUTH_REPLAY);
+    env_t nfm = sign(a, ID_B, "n", 1);
+    CHECK_ERR(verify(r, &nfm), ESP_ERR_MSG_AUTH_NOT_FOR_ME);
+    st = ctx_stats(r);
+    CHECK(st.bad_tag_total == 2 && st.wrong_sender == 2);
+    CHECK(stats(r, ID_A).bad_tag == 1 && stats(r, ID_B).bad_tag == 1);
+    CHECK_ERR(msg_auth_reset_peer(r, ID_A), ESP_OK);            /* reset keeps stats */
+    CHECK(ctx_stats(r).bad_tag_total == 2);
+    msg_auth_delete(a); msg_auth_delete(b); msg_auth_delete(r);
+}
+
+/* T33: concurrency through verify_from.
+ * (a) T22 via verify_from: bad_tag and bad_tag_total exact.
+ * (b) T24 via verify_from: outcomes consistent with §6.1.
+ * (c) two links in parallel, each fed its own sender's stream plus the other
+ *     sender's envelopes: every own envelope accepted, every cross one
+ *     WRONG_SENDER, and the counts exact (WRONG_SENDER never races state). */
+static void *link_job(void *arg)
+{
+    job_t *j = arg;
+    pthread_barrier_wait(&s_barrier);
+    j->result = ESP_OK;
+    for (int i = 0; i < j->count; i++) {
+        const env_t *own = &j->envs[2 * i], *cross = &j->envs[2 * i + 1];
+        if (job_verify(j, cross) != ESP_ERR_MSG_AUTH_WRONG_SENDER) j->result = ESP_FAIL;
+        if (job_verify(j, own)   != ESP_OK)                        j->result = ESP_FAIL;
+    }
+    return NULL;
+}
+
+TEST(t33_concurrent_verify_from)
+{
+    /* (a) */
+    {
+        msg_auth_handle_t a = make(ID_A, 1), r = make(ID_C, 1);
+        enum { PER = 300 };
+        static env_t bad[THREADS][PER];
+        for (int t = 0; t < THREADS; t++) {
+            for (int i = 0; i < PER; i++) {
+                bad[t][i] = sign(a, ID_C, "z", 1);
+                bad[t][i].buf[bad[t][i].len - 2] ^= 0x01;
+            }
+        }
+        pthread_t th[THREADS]; job_t jobs[THREADS];
+        pthread_barrier_init(&s_barrier, NULL, THREADS);
+        for (int t = 0; t < THREADS; t++) {
+            jobs[t] = (job_t){ .h = r, .envs = bad[t], .count = PER, .result = ESP_OK,
+                               .use_from = true, .expected = ID_A };
+            pthread_create(&th[t], NULL, verify_bad_job, &jobs[t]);
+        }
+        for (int t = 0; t < THREADS; t++) {
+            pthread_join(th[t], NULL);
+            CHECK_ERR(jobs[t].result, ESP_OK);
+        }
+        pthread_barrier_destroy(&s_barrier);
+        CHECK(stats(r, ID_A).bad_tag == THREADS * PER && stats(r, ID_A).seen == 0);
+        CHECK(ctx_stats(r).bad_tag_total == THREADS * PER);
+        msg_auth_delete(a); msg_auth_delete(r);
+    }
+    /* (b) */
+    {
+        msg_auth_handle_t a = make(ID_A, 1), r = make(ID_C, 1);
+        enum { ROUNDS = 1000 };
+        int both = 0, older_rejected = 0, bad = 0;
+        pthread_barrier_init(&s_barrier, NULL, 2);
+        for (int i = 0; i < ROUNDS; i++) {
+            env_t older = sign(a, ID_C, "o", 1), newer = sign(a, ID_C, "n", 1);
+            job_t jo = { .h = r, .envs = &older, .use_from = true, .expected = ID_A };
+            job_t jn = { .h = r, .envs = &newer, .use_from = true, .expected = ID_A };
+            pthread_t to, tn;
+            pthread_create(&to, NULL, verify_one_job, &jo);
+            pthread_create(&tn, NULL, verify_one_job, &jn);
+            pthread_join(to, NULL); pthread_join(tn, NULL);
+            if (jo.result == ESP_OK && jn.result == ESP_OK) both++;
+            else if (jo.result == ESP_ERR_MSG_AUTH_REPLAY && jn.result == ESP_OK) older_rejected++;
+            else bad++;
+        }
+        pthread_barrier_destroy(&s_barrier);
+        CHECK(bad == 0);
+        msg_auth_peer_stats_t st = stats(r, ID_A);
+        CHECK(st.accepted == (uint32_t)(2 * both + older_rejected));
+        CHECK(st.replay == (uint32_t)older_rejected);
+        CHECK(st.last_counter == 2 * ROUNDS - 1);
+        msg_auth_delete(a); msg_auth_delete(r);
+    }
+    /* (c) */
+    {
+        msg_auth_handle_t a = make(ID_A, 1), b = make(ID_B, 1), r = make(ID_C, 1);
+        enum { PER = 1000 };
+        static env_t link_a[2 * PER], link_b[2 * PER];
+        for (int i = 0; i < PER; i++) {
+            env_t ea = sign(a, ID_C, "a", 1), eb = sign(b, ID_C, "b", 1);
+            link_a[2 * i] = ea; link_a[2 * i + 1] = eb;    /* own A, relayed B */
+            link_b[2 * i] = eb; link_b[2 * i + 1] = ea;    /* own B, relayed A */
+        }
+        pthread_t ta, tb;
+        job_t ja = { .h = r, .envs = link_a, .count = PER, .use_from = true, .expected = ID_A };
+        job_t jb = { .h = r, .envs = link_b, .count = PER, .use_from = true, .expected = ID_B };
+        pthread_barrier_init(&s_barrier, NULL, 2);
+        pthread_create(&ta, NULL, link_job, &ja);
+        pthread_create(&tb, NULL, link_job, &jb);
+        pthread_join(ta, NULL); pthread_join(tb, NULL);
+        pthread_barrier_destroy(&s_barrier);
+        CHECK_ERR(ja.result, ESP_OK);
+        CHECK_ERR(jb.result, ESP_OK);
+        CHECK(stats(r, ID_A).accepted == PER && stats(r, ID_A).replay == 0);
+        CHECK(stats(r, ID_B).accepted == PER && stats(r, ID_B).replay == 0);
+        CHECK(ctx_stats(r).wrong_sender == 2 * PER && ctx_stats(r).bad_tag_total == 0);
+        msg_auth_delete(a); msg_auth_delete(b); msg_auth_delete(r);
+    }
+}
+
 int main(void)
 {
     if (getenv("MSG_AUTH_TEST_VERBOSE")) shim_log_verbose = 1;
@@ -852,6 +1227,14 @@ int main(void)
     RUN(t23_concurrent_sign);
     RUN(t24_concurrent_consecutive);
     RUN(t25_receiver_restart);
+    RUN(t26_verify_from_right_sender);
+    RUN(t27_cross_link);
+    RUN(t28_wrong_sender_before_tag);
+    RUN(t29_verify_from_arguments_and_outputs);
+    RUN(t30_verify_from_bit_flips);
+    RUN(t31_verify_from_crypto_failure);
+    RUN(t32_context_stats);
+    RUN(t33_concurrent_verify_from);
 
     const int leaks = shim_live_allocs(), keys = shim_live_keys();
     if (leaks || keys) {

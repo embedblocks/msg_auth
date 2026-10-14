@@ -1,16 +1,18 @@
 /*
  * msg_auth sign_verify: in-process demonstration and acceptance test (MSG_AUTH_SPEC.md §11).
  *
- * No Wi-Fi, no network: msg_auth needs nothing but bytes. Three contexts live in
+ * No Wi-Fi, no network: msg_auth needs nothing but bytes. These contexts live in
  * one task:
  *
  *   A         node 0, the test key
+ *   A'        node 0 again, "after a reboot" (epoch + 1)
  *   B         node 1, the test key: the receiver in every scenario
+ *   C         node 2, the test key: a second genuine sender, for the cross-link case
  *   outsider  claims to be node 0, but holds a different key
  *
  * A "channel" is just a buffer passed from one context to another. Each scenario
- * logs its result and expectation and prints PASS or FAIL; the run ends with
- * timing figures and B's per-peer statistics.
+ * logs its result and expectation and prints PASS or FAIL. Then target_checks.c
+ * measures everything MSG_AUTH_SPEC.md §9.3 asks for and prints it as one block.
  *
  * The epoch comes from a boot counter in NVS, committed before any context is
  * created (§6.2). This app reserves two epochs per boot, because it also runs
@@ -26,23 +28,23 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_system.h"
-#include "esp_timer.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
 #include "msg_auth.h"
+#include "example.h"
 
 static const char *TAG = "sign_verify";
 
 #define PURPOSE      "status"
 #define ID_A         0
 #define ID_B         1
-#define ID_C         2              /* exists only as an address */
+#define ID_C         2              /* a second genuine sender */
 #define MAX_ID       2
-#define TIMING_RUNS  200
 
-static msg_auth_handle_t s_a, s_a2, s_b, s_out;
+static msg_auth_handle_t s_a, s_a2, s_b, s_c, s_out;
 static int s_pass, s_fail;
+static uint32_t s_epoch;
 
 /* one envelope buffer, static: 1460 bytes is too much for a default stack */
 static uint8_t s_env[MSG_AUTH_MAX_ENVELOPE + 1];
@@ -106,11 +108,11 @@ static esp_err_t b_verify(const void *in, size_t len, uint8_t *sender,
     return msg_auth_verify(s_b, in, len, sender, msg, msg_len);
 }
 
-static void expect(const char *scenario, esp_err_t got, esp_err_t want)
+void expect(const char *scenario, esp_err_t got, esp_err_t want)
 {
     const bool ok = got == want;
     ok ? s_pass++ : s_fail++;
-    ESP_LOGI(TAG, "%-4s %-44s got %-28s want %s", ok ? "PASS" : "FAIL", scenario,
+    ESP_LOGI(TAG, "%-4s %-45s got %-29s want %s", ok ? "PASS" : "FAIL", scenario,
              msg_auth_err_to_name(got), msg_auth_err_to_name(want));
 }
 
@@ -186,36 +188,52 @@ static void run_scenarios(void)
     ESP_ERROR_CHECK(msg_auth_reset_peer(s_b, ID_A));   /* administrative, local (§6.4) */
     expect("older epoch after msg_auth_reset_peer", b_verify(s_env, s_env_len, &sender, &m, &n),
            ESP_OK);
-}
 
-/* ---- timing ---- */
-
-static void time_one(size_t len)
-{
-    int64_t t_sign = 0, t_verify = 0;
-    for (int i = 0; i < TIMING_RUNS; i++) {
-        int64_t t0 = esp_timer_get_time();
-        sign_or_die(s_a, ID_B, s_msg, len);
-        int64_t t1 = esp_timer_get_time();
-        uint8_t s; const void *m; size_t n;
-        esp_err_t err = b_verify(s_env, s_env_len, &s, &m, &n);
-        int64_t t2 = esp_timer_get_time();
-        ESP_ERROR_CHECK(err);
-        t_sign   += t1 - t0;
-        t_verify += t2 - t1;
+    /* 9. msg_auth_verify_from: B knows which sender each "link" belongs to */
+    msg_auth_rx_info_t info = { 0, 0 };
+    sign_or_die(s_a2, ID_B, text, sizeof text);
+    err = msg_auth_verify_from(s_b, ID_A, s_env, s_env_len, &m, &n, &info);
+    if (err == ESP_OK && (info.epoch != s_epoch + 1 || n != sizeof text)) {
+        err = ESP_FAIL;                         /* accepted, but info or message wrong */
     }
-    ESP_LOGI(TAG, "timing %4u B: sign %5" PRId64 " us, verify %5" PRId64 " us (mean of %d)",
-             (unsigned)len, t_sign / TIMING_RUNS, t_verify / TIMING_RUNS, TIMING_RUNS);
+    expect("verify_from: A's envelope on A's link", err, ESP_OK);
+
+    sign_or_die(s_c, ID_B, "from C", 6);        /* first message from C */
+    expect("verify_from: C's envelope on C's link",
+           msg_auth_verify_from(s_b, ID_C, s_env, s_env_len, &m, &n, NULL), ESP_OK);
+
+    /* the cross-link case: C's genuine envelope relayed onto A's link */
+    msg_auth_peer_stats_t c_before, c_after;
+    ESP_ERROR_CHECK(msg_auth_get_peer_stats(s_b, ID_C, &c_before));
+    sign_or_die(s_c, ID_B, "from C", 6);
+    expect("verify_from: C's envelope relayed to A's link",
+           msg_auth_verify_from(s_b, ID_A, s_env, s_env_len, &m, &n, NULL),
+           ESP_ERR_MSG_AUTH_WRONG_SENDER);
+    ESP_ERROR_CHECK(msg_auth_get_peer_stats(s_b, ID_C, &c_after));
+    expect("verify_from: C's state untouched by relay",
+           memcmp(&c_before, &c_after, sizeof c_before) == 0 ? ESP_OK : ESP_FAIL, ESP_OK);
+    expect("verify_from: C's own copy still accepted",
+           msg_auth_verify_from(s_b, ID_C, s_env, s_env_len, &m, &n, NULL), ESP_OK);
+    expect("verify_from: expected sender = own ID",
+           msg_auth_verify_from(s_b, ID_B, s_env, s_env_len, &m, &n, NULL), ESP_ERR_INVALID_ARG);
 }
 
 static void print_stats(uint8_t peer)
 {
     msg_auth_peer_stats_t st;
     ESP_ERROR_CHECK(msg_auth_get_peer_stats(s_b, peer, &st));
-    ESP_LOGI(TAG, "B <- node %u: accepted %" PRIu32 ", bad_tag %" PRIu32 ", replay %" PRIu32
-             ", last (%" PRIu32 ", %" PRIu32 ")%s",
+    ESP_LOGI(TAG, "B <- node %u: accepted %" PRIu32 ", bad_tag (claimed) %" PRIu32
+             ", replay %" PRIu32 ", last (%" PRIu32 ", %" PRIu32 ")%s",
              peer, st.accepted, st.bad_tag, st.replay, st.last_epoch, st.last_counter,
              st.seen ? "" : ", not seen");
+}
+
+static void print_ctx_stats(void)
+{
+    msg_auth_stats_t st;
+    ESP_ERROR_CHECK(msg_auth_get_stats(s_b, &st));
+    ESP_LOGI(TAG, "B context: bad_tag_total %" PRIu32 ", wrong_sender %" PRIu32,
+             st.bad_tag_total, st.wrong_sender);
 }
 
 void app_main(void)
@@ -232,6 +250,7 @@ void app_main(void)
     other[0] ^= 0x01;                           /* the outsider's key: one bit different */
 
     const uint32_t epoch = reserve_epochs(2);  /* epoch for A, epoch + 1 for "rebooted" A */
+    s_epoch = epoch;
     ESP_LOGI(TAG, "epoch %" PRIu32 " (committed to NVS before create)", epoch);
 
     msg_auth_config_t cfg = {
@@ -242,30 +261,40 @@ void app_main(void)
     cfg.epoch = epoch + 1;
     ESP_ERROR_CHECK(msg_auth_create(&cfg, &s_a2));
     cfg.my_id = ID_B;
-    cfg.epoch = epoch;                          /* B signs nothing here; any epoch will do */
+    cfg.epoch = epoch;                          /* B's own signing is only used by the checks */
     ESP_ERROR_CHECK(msg_auth_create(&cfg, &s_b));
+    cfg.my_id = ID_C;
+    ESP_ERROR_CHECK(msg_auth_create(&cfg, &s_c));
     cfg.key = other;
     cfg.my_id = ID_A;
     ESP_ERROR_CHECK(msg_auth_create(&cfg, &s_out));
 
-    memset(key, 0, sizeof key);                 /* not retained by msg_auth: wipe it */
-    memset(other, 0, sizeof other);
     for (size_t i = 0; i < sizeof s_msg; i++) {
         s_msg[i] = (uint8_t)(i * 31 + 7);
     }
 
     run_scenarios();
-    time_one(64);
-    time_one(MSG_AUTH_MAX_MESSAGE);
     print_stats(ID_A);
     print_stats(ID_C);
+    print_ctx_stats();
+
+    /* §9.3: A' (newest epoch) and C sign to B; B also signs to A (for the
+     * same-key concurrency check). `key` is still needed for the create check. */
+    const example_nodes_t nodes = {
+        .a = s_a2, .a_id = ID_A, .b = s_b, .b_id = ID_B, .c = s_c, .c_id = ID_C,
+        .a_receiver = s_a,
+        .key = key, .key_len = key_len, .purpose = PURPOSE, .max_peer_id = MAX_ID,
+    };
+    target_checks_run(&nodes);
+
+    memset(key, 0, sizeof key);                 /* not retained by msg_auth: wipe it */
+    memset(other, 0, sizeof other);
 
     ESP_LOGI(TAG, "%s: %d passed, %d failed", s_fail ? "FAIL" : "PASS", s_pass, s_fail);
-    ESP_LOGI(TAG, "free heap %" PRIu32 " bytes, main stack high-water %u bytes",
-             esp_get_free_heap_size(), (unsigned)uxTaskGetStackHighWaterMark(NULL));
 
     msg_auth_delete(s_a);
     msg_auth_delete(s_a2);
     msg_auth_delete(s_b);
+    msg_auth_delete(s_c);
     msg_auth_delete(s_out);
 }

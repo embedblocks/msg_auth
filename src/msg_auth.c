@@ -62,6 +62,7 @@ struct msg_auth {
     uint8_t               max_peer_id;
     uint32_t              epoch;
     uint32_t              counter;          /* guarded by mutex                       */
+    msg_auth_stats_t      stats;            /* guarded by mutex                       */
     msg_auth_peer_stats_t peer[];           /* max_peer_id + 1 entries, guarded       */
 };
 
@@ -221,7 +222,7 @@ esp_err_t msg_auth_create(const msg_auth_config_t *cfg, msg_auth_handle_t *out)
     h->my_id       = cfg->my_id;                                /* step 6 */
     h->max_peer_id = cfg->max_peer_id;
     h->epoch       = cfg->epoch;
-    h->counter     = 0;                                         /* peers zeroed by calloc */
+    h->counter     = 0;                         /* peers and context stats zeroed by calloc */
 
     *out = h;                                                   /* step 7 */
     return ESP_OK;
@@ -300,19 +301,22 @@ esp_err_t msg_auth_sign(msg_auth_handle_t h, uint8_t receiver_id,
     return ESP_OK;
 }
 
-/* ---- msg_auth_verify (§5.4) ---- */
-
-esp_err_t msg_auth_verify(msg_auth_handle_t h,
-                          const void *in, size_t in_len,
-                          uint8_t *sender_id,
-                          const void **msg, size_t *msg_len)
+/* ---- shared verification path (§5.4, §5.4a) ----
+ *
+ * Steps 1-7 for both public entry points, so the two cannot drift apart.
+ * Step 0 (argument checks) is done by each entry point before calling this.
+ *
+ *   expected < 0      msg_auth_verify():      no step 4a
+ *   expected 0..255   msg_auth_verify_from(): step 4a rejects any other sender
+ *
+ * *sender_out (if non-null) is written from step 5 on, as §5.4 requires of
+ * msg_auth_verify(). *msg, *msg_len and *info (if non-null) only on ESP_OK. */
+static esp_err_t verify_common(msg_auth_handle_t h, int expected,
+                               const uint8_t *env, size_t in_len,
+                               uint8_t *sender_out,
+                               const void **msg, size_t *msg_len,
+                               msg_auth_rx_info_t *info)
 {
-    /* step 0 */
-    if (h == NULL || in == NULL || sender_id == NULL || msg == NULL || msg_len == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    const uint8_t *env = in;
-
     /* steps 1-2 */
     msg_auth_hdr_t hdr;
     esp_err_t err = msg_auth_hdr_decode(env, in_len, &hdr);
@@ -324,7 +328,17 @@ esp_err_t msg_auth_verify(msg_auth_handle_t h,
     if (err != ESP_OK) {
         return err;
     }
-    *sender_id = hdr.sender_id;
+    /* step 4a (verify_from only): unauthenticated routing result, before any MAC.
+     * No per-peer stats or freshness change; only the context-wide counter. */
+    if (expected >= 0 && hdr.sender_id != (uint8_t)expected) {
+        lock(h);
+        h->stats.wrong_sender++;
+        unlock(h);
+        return ESP_ERR_MSG_AUTH_WRONG_SENDER;
+    }
+    if (sender_out != NULL) {
+        *sender_out = hdr.sender_id;
+    }
 
     /* step 5: tag first, outside the mutex. Freshness is not read or changed yet. */
     const size_t signed_len = in_len - MSG_AUTH_TAG_SIZE;
@@ -332,7 +346,8 @@ esp_err_t msg_auth_verify(msg_auth_handle_t h,
     err = mac_verify(h->key, env, signed_len, env + signed_len);
     if (err == ESP_ERR_MSG_AUTH_BAD_TAG) {
         lock(h);
-        p->bad_tag++;
+        p->bad_tag++;               /* charged to the CLAIMED sender (§5.4 rules) */
+        h->stats.bad_tag_total++;
         unlock(h);
         return err;
     }
@@ -355,7 +370,40 @@ esp_err_t msg_auth_verify(msg_auth_handle_t h,
 
     *msg     = env + MSG_AUTH_HEADER_SIZE;      /* borrowed: points into `in` */
     *msg_len = hdr.msg_len;
+    if (info != NULL) {
+        info->epoch   = hdr.epoch;
+        info->counter = hdr.counter;
+    }
     return ESP_OK;
+}
+
+/* ---- msg_auth_verify (§5.4) ---- */
+
+esp_err_t msg_auth_verify(msg_auth_handle_t h,
+                          const void *in, size_t in_len,
+                          uint8_t *sender_id,
+                          const void **msg, size_t *msg_len)
+{
+    /* step 0 */
+    if (h == NULL || in == NULL || sender_id == NULL || msg == NULL || msg_len == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return verify_common(h, -1, in, in_len, sender_id, msg, msg_len, NULL);
+}
+
+/* ---- msg_auth_verify_from (§5.4a) ---- */
+
+esp_err_t msg_auth_verify_from(msg_auth_handle_t h, uint8_t expected_sender,
+                               const void *in, size_t in_len,
+                               const void **msg, size_t *msg_len,
+                               msg_auth_rx_info_t *info)
+{
+    /* step 0: every argument, including expected_sender, before the envelope is read */
+    if (h == NULL || in == NULL || msg == NULL || msg_len == NULL ||
+        !msg_auth_peer_id_ok(expected_sender, h->my_id, h->max_peer_id)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return verify_common(h, expected_sender, in, in_len, NULL, msg, msg_len, info);
 }
 
 /* ---- msg_auth_reset_peer (§5.5) ---- */
@@ -385,6 +433,19 @@ esp_err_t msg_auth_get_peer_stats(msg_auth_handle_t h, uint8_t peer_id,
     return ESP_OK;
 }
 
+/* ---- msg_auth_get_stats (§5.8) ---- */
+
+esp_err_t msg_auth_get_stats(msg_auth_handle_t h, msg_auth_stats_t *stats)
+{
+    if (h == NULL || stats == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    lock(h);
+    *stats = h->stats;
+    unlock(h);
+    return ESP_OK;
+}
+
 /* ---- msg_auth_err_to_name (§5.7) ---- */
 
 const char *msg_auth_err_to_name(esp_err_t err)
@@ -396,6 +457,7 @@ const char *msg_auth_err_to_name(esp_err_t err)
     case ESP_ERR_MSG_AUTH_BAD_TAG:    return "ESP_ERR_MSG_AUTH_BAD_TAG";
     case ESP_ERR_MSG_AUTH_REPLAY:     return "ESP_ERR_MSG_AUTH_REPLAY";
     case ESP_ERR_MSG_AUTH_EXHAUSTED:  return "ESP_ERR_MSG_AUTH_EXHAUSTED";
+    case ESP_ERR_MSG_AUTH_WRONG_SENDER: return "ESP_ERR_MSG_AUTH_WRONG_SENDER";
     default:                          return esp_err_to_name(err);
     }
 }

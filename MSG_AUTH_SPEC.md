@@ -16,7 +16,7 @@ This file is everything needed to implement the component. If a plausible implem
 
 - **No encryption.** Messages travel in clear; integrity and authenticity only. The envelope reserves a `mode` value for a future authenticated-encryption mode.
 - **No sessions, handshakes, key exchange, peer discovery or transport management.** These belong to a higher-level component (a secure channel), never to msg_auth.
-- **No per-node identity proof.** All holders of the installation key are equally trusted. Any of them can sign as any `sender_id`, and can therefore also advance another sender's freshness state and cause that sender's genuine messages to be rejected. `sender_id` is an authenticated claim by a key holder, not proof of which physical node sent the message. Callers that know the expected sender (e.g. from the link the message arrived on) check `sender_id` themselves.
+- **No per-node identity proof.** All holders of the installation key are equally trusted. Any of them can sign as any `sender_id`, and can therefore also advance another sender's freshness state and cause that sender's genuine messages to be rejected. `sender_id` is an authenticated claim by a key holder, not proof of which physical node sent the message. Callers that know the expected sender (e.g. from the link the message arrived on) use `msg_auth_verify_from()` (§5.4a), which rejects any other sender **before** that sender's freshness state can move. This stops outsiders who relay one node's genuine envelopes onto another node's link; it does not stop a key holder, who can still sign as the expected sender.
 - **No independent trust domains.** Purpose labels separate keys by use (domain separation); they do not isolate a compromised key holder, who can derive every purpose key.
 - **No reordering tolerance.** Messages must arrive in increasing order per sender; an older one is rejected as a replay (§6). Suitable for state-type traffic, not for audio or other streams that may be reordered.
 
@@ -93,6 +93,7 @@ extern "C" {
 #define ESP_ERR_MSG_AUTH_BAD_TAG     (ESP_ERR_MSG_AUTH_BASE + 4)  /* forged, altered or wrong key    */
 #define ESP_ERR_MSG_AUTH_REPLAY      (ESP_ERR_MSG_AUTH_BASE + 5)  /* freshness pair not newer        */
 #define ESP_ERR_MSG_AUTH_EXHAUSTED   (ESP_ERR_MSG_AUTH_BASE + 6)  /* counter used up: new epoch needed */
+#define ESP_ERR_MSG_AUTH_WRONG_SENDER (ESP_ERR_MSG_AUTH_BASE + 7) /* sender_id != expected (unauthenticated) */
 
 typedef struct msg_auth *msg_auth_handle_t;
 
@@ -107,12 +108,25 @@ typedef struct {
 
 typedef struct {
     uint32_t accepted;
-    uint32_t bad_tag;
+    uint32_t bad_tag;            /* tag failures CLAIMING this sender: the ID is unauthenticated,
+                                    so anyone can raise it; see msg_auth_stats_t.bad_tag_total */
     uint32_t replay;
     uint32_t last_epoch;         /* freshness pair of the last accepted message */
     uint32_t last_counter;
     uint8_t  seen;               /* 0 until the first accepted message          */
 } msg_auth_peer_stats_t;
+
+/* Context-wide counters (§5.8). Fields may be appended in later versions. */
+typedef struct {
+    uint32_t bad_tag_total;      /* all BAD_TAG results, whatever sender they claimed       */
+    uint32_t wrong_sender;       /* all WRONG_SENDER results from msg_auth_verify_from()    */
+} msg_auth_stats_t;
+
+/* Verified freshness pair of an accepted message (msg_auth_verify_from). */
+typedef struct {
+    uint32_t epoch;
+    uint32_t counter;
+} msg_auth_rx_info_t;
 
 /* Create a context. Derives the purpose key into the PSA key store.
  * The installation key buffer may be wiped by the caller after return. */
@@ -139,6 +153,19 @@ esp_err_t msg_auth_verify(msg_auth_handle_t h,
                           uint8_t *sender_id,
                           const void **msg, size_t *msg_len);
 
+/* Like msg_auth_verify(), for callers that know the only acceptable sender
+ * (e.g. from the link the envelope arrived on). An envelope claiming any other
+ * sender is rejected with ESP_ERR_MSG_AUTH_WRONG_SENDER before the tag is
+ * checked, and that sender's freshness state and statistics are not touched.
+ * expected_sender must be a valid peer ID (<= max_peer_id, != my_id).
+ * On ESP_OK, *msg borrows from `in` as in msg_auth_verify(), and *info (if
+ * non-null) holds the verified freshness pair. *msg, *msg_len and *info are
+ * written only on ESP_OK. Step table: §5.4a. */
+esp_err_t msg_auth_verify_from(msg_auth_handle_t h, uint8_t expected_sender,
+                               const void *in, size_t in_len,
+                               const void **msg, size_t *msg_len,
+                               msg_auth_rx_info_t *info);
+
 /* ADMINISTRATIVE: forget one peer's freshness state (stats kept).
  * Re-opens acceptance of that peer's historical messages; see §6.4.
  * Call only from trusted local recovery logic, never on a network request. */
@@ -146,6 +173,9 @@ esp_err_t msg_auth_reset_peer(msg_auth_handle_t h, uint8_t peer_id);
 
 esp_err_t msg_auth_get_peer_stats(msg_auth_handle_t h, uint8_t peer_id,
                                   msg_auth_peer_stats_t *stats);
+
+/* Copy the context-wide counters. */
+esp_err_t msg_auth_get_stats(msg_auth_handle_t h, msg_auth_stats_t *stats);
 
 const char *msg_auth_err_to_name(esp_err_t err);
 
@@ -219,7 +249,7 @@ The last counter value signed in an epoch is `UINT32_MAX − 1`; the next call r
 | 2 | `in_len < 28`, or `version != 1`, or `mode != 1` | `ESP_ERR_MSG_AUTH_MALFORMED` | none | none |
 | 3 | `receiver_id != my_id` | `ESP_ERR_MSG_AUTH_NOT_FOR_ME` (an unauthenticated routing result) | none | none |
 | 4 | `sender_id > max_peer_id` or `sender_id == my_id` | `ESP_ERR_MSG_AUTH_UNKNOWN` | none | none |
-| 5 | Verify the tag over `in[0 … in_len−17]` (§9), **outside the mutex** | mismatch: `ESP_ERR_MSG_AUTH_BAD_TAG`; crypto failure: `ESP_FAIL` | mismatch: `bad_tag++` **under the mutex**; crypto failure: none | `*sender_id` |
+| 5 | Verify the tag over `in[0 … in_len−17]` (§9), **outside the mutex** | mismatch: `ESP_ERR_MSG_AUTH_BAD_TAG`; crypto failure: `ESP_FAIL` | mismatch: the claimed sender's `bad_tag++` and the context's `bad_tag_total++`, **under the mutex**; crypto failure: none | `*sender_id` |
 | 6 | **Under the mutex:** if the peer is seen and `(epoch, counter) ≤ (last_epoch, last_counter)` | `ESP_ERR_MSG_AUTH_REPLAY` | `replay++` | `*sender_id` |
 | 7 | **Same critical section:** store the pair, `seen = 1`, `accepted++` | `ESP_OK` | — | `*sender_id`, `*msg = in + 12`, `*msg_len = in_len − 28` |
 
@@ -228,6 +258,24 @@ Rules:
 - **A crypto-library failure is never an authentication result:** it returns `ESP_FAIL`, does not count as `bad_tag`, does not touch freshness state, and never accepts the message.
 - **Every** change to statistics and freshness state happens under the mutex.
 - `*msg` and `*msg_len` are written only on `ESP_OK`; `*sender_id` only for steps 5–7.
+- **`bad_tag` is charged to the claimed sender.** On a tag mismatch the header is unauthenticated, so anyone can raise any peer's `bad_tag` by forging that byte. The per-peer field therefore means "forgeries and corruptions claiming to be this sender"; `bad_tag_total` (§5.8) counts them all, whatever they claim.
+- Steps 1–7 are implemented once and shared with `msg_auth_verify_from()` (§5.4a), so the two entry points cannot drift apart.
+
+### 5.4a `msg_auth_verify_from` (added in 0.2.0)
+
+For callers that know the only acceptable sender, e.g. a link with exactly one peer. Same contract as `msg_auth_verify()` (borrowed `*msg`, distinct non-overlapping outputs), with an expected sender instead of a `sender_id` output and an optional `info` output.
+
+| # | Check | Result | Stats | Outputs written |
+| --- | --- | --- | --- | --- |
+| 0 | Null handle / `in` / `msg` / `msg_len`; or `expected_sender > max_peer_id` or `== my_id` | `ESP_ERR_INVALID_ARG`, **whatever the envelope contains** (it is not read) | none | none |
+| 1–4 | As §5.4 | as §5.4 | none | none |
+| 4a | `sender_id != expected_sender` | `ESP_ERR_MSG_AUTH_WRONG_SENDER` (an unauthenticated routing result, like `NOT_FOR_ME`) | context `wrong_sender++` under the mutex; **no per-peer stats, no freshness change** | none |
+| 5–7 | As §5.4 | as §5.4 | as §5.4 | `*msg`, `*msg_len` and `*info` (if non-null) **only on `ESP_OK`** |
+
+Rules:
+- **Step 4a runs before the tag check.** It can never cause an acceptance, it saves an HMAC on misrouted packets, and it means a genuine envelope from another sender, relayed onto this link, cannot advance that sender's freshness state. Step 4 still runs first, so a sender byte equal to `my_id` or above `max_peer_id` is `UNKNOWN`, not `WRONG_SENDER`.
+- `info` may be null. On `ESP_OK` it holds the verified `(epoch, counter)` of the accepted envelope (see §6.3).
+- `msg_auth_verify()` is unchanged; `msg_auth_verify_from()` is the only way to obtain `info`.
 
 ### 5.5 `msg_auth_reset_peer`
 
@@ -239,7 +287,18 @@ Same ID checks as `reset_peer`; null `stats` → `ESP_ERR_INVALID_ARG`. Copies u
 
 ### 5.7 `msg_auth_err_to_name`
 
-Returns the names of all six msg_auth codes; `esp_err_to_name()` for any other value.
+Returns the names of all seven msg_auth codes (including `ESP_ERR_MSG_AUTH_WRONG_SENDER`, 0.2.0); `esp_err_to_name()` for any other value.
+
+### 5.8 `msg_auth_get_stats` (added in 0.2.0)
+
+Null handle or `stats` → `ESP_ERR_INVALID_ARG`. Copies the context-wide counters under the mutex:
+
+| Field | Counts |
+| --- | --- |
+| `bad_tag_total` | every `BAD_TAG` result from either verify function, whatever sender it claimed |
+| `wrong_sender` | every `WRONG_SENDER` result from `msg_auth_verify_from()`; a rising count on a link is what a relay attack looks like |
+
+Neither can be attributed to an innocent peer. `msg_auth_reset_peer()` does not change them. Fields may be appended in later versions (callers that compile from source are unaffected).
 
 ## 6. Freshness and replay
 
@@ -263,6 +322,8 @@ msg_auth cannot enforce these; the caller must:
 
 Replay protection lasts **as long as the receiver's context**. Freshness state is kept in RAM; after a receiver restarts, the **first** authenticated message from each peer is accepted whatever its freshness pair, so a captured old message could be accepted once at that moment.
 
+**Event identity.** A caller that deduplicates events (e.g. a doorbell event identified by `(sender, epoch, event_id)`) takes the epoch from `info.epoch` of `msg_auth_verify_from()`, which is the verified value of the accepted envelope, never from bytes read out of a packet before verification.
+
 This suits **state-type traffic**, where a newer message supersedes an older one (status updates, periodic reports) and harmless events (a doorbell). It does **not** suit one-shot commands that must never execute twice (e.g. door unlock); those need a stronger mechanism at a higher layer (persistent state or a session challenge).
 
 ### 6.4 Recovery (`msg_auth_reset_peer`)
@@ -280,8 +341,9 @@ The valid counter range per epoch is `0 … UINT32_MAX − 1` (2³² − 1 value
 
 | Call | May run concurrently with | Mechanism |
 | --- | --- | --- |
-| `sign` | `sign`, `verify`, `get_peer_stats` | counter reserved under the mutex; MAC computed outside it |
-| `verify` | `sign`, `verify`, `get_peer_stats` | MAC verified outside the mutex; all stats and freshness changes under it |
+| `sign` | `sign`, `verify`, `verify_from`, `get_peer_stats`, `get_stats` | counter reserved under the mutex; MAC computed outside it |
+| `verify`, `verify_from` | `sign`, `verify`, `verify_from`, `get_peer_stats`, `get_stats` | MAC verified outside the mutex; all stats and freshness changes under it |
+| `get_peer_stats`, `get_stats` | anything except `delete` | copied under the mutex |
 | `reset_peer` | anything except `delete` | under the mutex |
 | `create` / `delete` | nothing on the same handle | caller's precondition |
 
@@ -291,7 +353,9 @@ The valid counter range per epoch is `0 … UINT32_MAX − 1` (2³² − 1 value
 
 ### Memory
 
-msg_auth makes **one allocation of its own** (the context, with the mutex stored inside it) in `create`, and **none** in `sign`, `verify` or the other calls. The PSA implementation may allocate internally (key slot, derivation, MAC operations); this is measured on the target (§9.3) and recorded, not assumed.
+msg_auth makes **one allocation of its own** (the context, with the mutex stored inside it) in `create`, and **none** in `sign`, `verify`, `verify_from` or the other calls. The PSA implementation may allocate internally (key slot, derivation, MAC operations); this is measured on the target (§9.3) and recorded, not assumed.
+
+On ESP-IDF 6.0.3 with `CONFIG_MBEDTLS_HARDWARE_SHA=y` (the default), ESP's transparent HMAC driver `malloc`s a block-size buffer for every MAC operation, so **each `sign` and `verify` briefly needs heap (280 bytes measured, §9.3)** and returns it. If that allocation fails, the call returns `ESP_FAIL` (a crypto failure: no `bad_tag`, no state change, §5.4 rules), never an authentication result.
 
 ## 8. Security requirements
 
@@ -320,19 +384,25 @@ Used if the target's PSA implementation does not accept the truncated-MAC policy
 
 ### 9.3 Target checks (done first, results recorded here)
 
-Run on the actual ESP-IDF 6.0 target before the implementation is considered final:
+Run on the actual ESP-IDF 6.0 target before the implementation is considered final. `examples/sign_verify` measures every row in one run and prints it as lines starting with `9.3 |` (§11).
 
-| Check | Result |
-| --- | --- |
-| HKDF output directly into an HMAC key with the required usage policy | Host, Mbed TLS 4.0.0: works only with the secret as an imported DERIVE key (§5.1 step 5, amended). Target: to record |
-| Truncated-MAC policy accepted (selects §9.1 or §9.2) | Host, Mbed TLS 4.0.0 built-in driver: accepted, both paths pass T1–T25. Target (ESP HMAC driver): to record |
-| Concurrent sign and verify from ≥ 2 tasks using the **same key ID**: no errors, all results correct | to record |
-| `psa_crypto_init()` behaviour when already initialised; failure handling | to record |
-| Heap: at `create`, per `sign`/`verify` (should be 0 from msg_auth itself), PSA internals | to record |
-| Peak stack use of `sign` / `verify` | to record |
-| Latency of `sign` / `verify` at 0, 64, 512 and 1432 bytes | to record |
+**Which driver runs (from the ESP-IDF 6.0.3 source).** The ESP **HMAC peripheral** is not involved: it computes with keys burned into eFuse, is reached through an opaque PSA driver, and the original ESP32 does not have one. msg_auth's derived key is a volatile, transparent PSA key. With `CONFIG_MBEDTLS_HARDWARE_SHA=y` (default) ESP-IDF defines `ESP_HMAC_TRANSPARENT_DRIVER_ENABLED` and PSA dispatches HMAC to ESP's **transparent HMAC driver**, which runs HMAC on the **SHA accelerator** (`components/mbedtls/port/psa_driver/esp_mac/psa_crypto_driver_esp_hmac_transparent.c`). It supports truncated output and compares with `mbedtls_ct_memcmp`. With hardware SHA disabled, Mbed TLS's built-in software HMAC is used.
 
-Each record states the ESP-IDF version, target chip, relevant PSA/Mbed TLS configuration and the implementation path selected.
+Results so far. **QEMU** is Espressif's ESP32 emulator (`idf.py qemu`, qemu-xtensa esp_develop_9.2.2_20260417): it runs the real firmware, including the SHA accelerator model, so correctness, heap and stack figures are meaningful; **its latencies are not** and are not recorded.
+
+| Check | Host (TF-PSA-Crypto / Mbed TLS 4.0.0) | ESP32, QEMU, ESP-IDF v6.0.3 | ESP32 / ESP32-S3 hardware |
+| --- | --- | --- | --- |
+| HKDF output directly into an HMAC key with the required usage policy | works only with the secret as an imported DERIVE key (§5.1 step 5, amended) | works | to record |
+| Truncated-MAC policy accepted (selects §9.1 or §9.2) | accepted; both paths pass all host tests | accepted; primary path selected. Fallback path also passes | to record |
+| HMAC driver in use | built-in software | ESP transparent HMAC driver on the SHA accelerator (`CONFIG_MBEDTLS_HARDWARE_SHA=y`) | to record (expected: same) |
+| Concurrent sign and verify from ≥ 2 tasks using the **same key ID** | T22–T24, T33 pass (pthreads) | PASS: 4 tasks (2 sign, 2 `verify_from`) on one context, 800 calls, counters distinct, statistics exact, both MAC paths | to record |
+| `psa_crypto_init()` when already initialised; failure handling | returns `PSA_SUCCESS`; failure → `ESP_FAIL` (T21) | returns `PSA_SUCCESS` | to record |
+| Heap: at `create` | — | 224 bytes (`max_peer_id` 2); 0 left after `delete` | to record |
+| Heap: per `sign` / `verify` / `verify_from` (0 from msg_auth itself) | 0 from msg_auth | peak 280 bytes during each call (PSA HMAC driver), net 0, both paths | to record |
+| Peak stack use of `sign` / `verify` / `verify_from` (1432 B) | — | primary 816 / 880 / 880 bytes; fallback 848 / 864 / 864 bytes | to record |
+| Latency of `sign` / `verify` at 0, 64, 512 and 1432 bytes | — | not meaningful in an emulator | to record |
+
+Each hardware record states the ESP-IDF version, target chip, relevant PSA/Mbed TLS configuration and the implementation path selected; the example prints all of these.
 
 ## 10. Code organisation and tests
 
@@ -343,7 +413,7 @@ msg_auth/
   src/msg_auth_pure.c        envelope encode/decode, freshness comparison,
                              purpose validation, fixed-length compare helper
   src/msg_auth.c             context, mutex, PSA calls
-  examples/sign_verify/      in-process example, no network (§11)
+  examples/sign_verify/      in-process example and §9.3 measurements, no network (§11)
   host_test/                 Unity / plain C on Linux
     fixtures/                independently generated known-answer vectors
   idf_component.yml          idf >= 6.0, < 6.1; PSA via the built-in mbedtls component
@@ -396,12 +466,22 @@ Generated **independently of the implementation** (e.g. with Python `hmac` / `ha
 | T23 | Two tasks signing concurrently: all counters distinct |
 | T24 | Two tasks verifying **consecutive counters from the same sender** concurrently: outcomes consistent with §6.1 (either both accepted in order, or the older rejected as `REPLAY`); stats consistent |
 | T25 | After a receiver restart, a previously accepted envelope is accepted once (documents §6.3) |
+| T26 | `verify_from` with the right sender: same result, message, length and stats as `verify`; `info` holds the envelope's epoch and counter; `info == NULL` accepted |
+| T27 | Cross-link: B's genuine envelope given to `verify_from(expected = A)` → `WRONG_SENDER` before any MAC; A's and B's stats and freshness unchanged; B's same envelope then accepted by `verify_from(expected = B)`. Also documents the 0.1.0 shape (`verify` + caller check), where B's own copy is then a `REPLAY` |
+| T28 | `WRONG_SENDER` takes priority over a bad tag (forgery claiming B, expected A): no `bad_tag` for either peer, `bad_tag_total` unchanged |
+| T29 | `verify_from` argument checks: `expected_sender` equal to `my_id`, above `max_peer_id`, or 255 → `INVALID_ARG` with a good, short or oversized envelope and no MAC; null arguments; `*msg`, `*msg_len`, `*info` untouched on every failure result; `get_stats` argument checks; `err_to_name(WRONG_SENDER)` |
+| T30 | T2 through `verify_from`: a sender byte flipped to another valid peer → `WRONG_SENDER`; to `my_id` or above max → `UNKNOWN`; counters exact |
+| T31 | T20 through `verify_from`: injected crypto failure → `ESP_FAIL`, no stats, no freshness change, outputs untouched |
+| T32 | `bad_tag_total` counts `BAD_TAG` from both entry points whatever sender is claimed; `wrong_sender` counts `WRONG_SENDER`; other results count in neither; `reset_peer` keeps them |
+| T33 | Concurrency through `verify_from`: T22 and T24 again, plus two links verified in parallel, each fed its own sender's stream and the other sender's envelopes: every own envelope accepted, every relayed one `WRONG_SENDER`, counts exact |
+
+T1–T25 are unchanged from 0.1.0 and still exercise `msg_auth_verify()` alone.
 
 ## 11. Example: `examples/sign_verify`
 
 Runs on any ESP32 board, **no Wi-Fi and no network**: msg_auth needs nothing but bytes.
 
-- Creates three contexts from a test key (menuconfig `EXAMPLE_PSK_HEX`, labelled insecure): node A (id 0), node B (id 1), and an "outsider" with a **different** key. The epoch comes from a boot counter in NVS, committed before create, showing how a real caller meets §6.2.
+- Creates contexts from a test key (menuconfig `EXAMPLE_PSK_HEX`, labelled insecure): node A (id 0), a "rebooted" A with epoch + 1, node B (id 1, the receiver), node C (id 2, a second genuine sender), and an "outsider" with a **different** key. The epoch comes from a boot counter in NVS, committed before create, showing how a real caller meets §6.2.
 - A "channel" is a buffer passed from one context to another in the same task.
 - Runs one scenario per row, logs result and expectation, prints PASS/FAIL:
 
@@ -415,15 +495,20 @@ Runs on any ESP32 board, **no Wi-Fi and no network**: msg_auth needs nothing but
 | Oversized, truncated, unsigned | `INVALID_SIZE` / `MALFORMED` |
 | Newer epoch (second A context with epoch + 1) | accepted |
 | Older epoch | `REPLAY`; after `msg_auth_reset_peer` accepted |
-| Timing | µs per sign/verify at 64 B and 1432 B |
+| `verify_from`: A's envelope on A's link | `ESP_OK`, `info.epoch` = A's epoch |
+| `verify_from`: C's genuine envelope relayed onto A's link | `WRONG_SENDER`; C's state unchanged; C's own copy then `ESP_OK` |
+| `verify_from` with the receiver's own ID as expected sender | `INVALID_ARG` |
+| Concurrent sign and `verify_from` on one key ID (4 tasks) | all results correct, counters distinct, statistics exact |
+| `psa_crypto_init` when already initialised | `PSA_SUCCESS` |
 
-- Ends with per-peer stats from `msg_auth_get_peer_stats`.
+- Prints per-peer stats (`msg_auth_get_peer_stats`) and context stats (`msg_auth_get_stats`).
+- Then prints the **§9.3 record**: ESP-IDF version, chip, MAC path, HMAC driver, key-policy result, concurrency result, heap at create and per call (peak and net), stack per call, and latency of sign / verify / verify_from at 0, 64, 512 and 1432 bytes.
 
 A networked example (nodes over `udp_link`) belongs to a separate component that depends on both msg_auth and udp_link. msg_auth, including its examples, never depends on a transport.
 
 ## 12. Open points
 
 1. Component name for publishing: `msg_auth`.
-2. Whether `verify` should take an `expected_sender` argument (currently the caller checks `sender_id`).
+2. ~~Whether `verify` should take an `expected_sender` argument.~~ **Resolved in 0.2.0:** `msg_auth_verify_from()` (§5.4a), added beside an unchanged `msg_auth_verify()`. A single function with an "any sender" wildcard was rejected because the wildcard is an easy value to pass by habit.
 3. Shape of the authenticated-encryption mode (`mode = 2`) for a future version, and the sliding replay window it would need for reorderable streams.
 4. Accepting the installation key as a persistent PSA key ID (stored via PSA Internal Trusted Storage) instead of raw bytes, so the secret never passes through application memory.

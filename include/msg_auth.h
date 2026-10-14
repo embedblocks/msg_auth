@@ -25,6 +25,7 @@ extern "C" {
 #define ESP_ERR_MSG_AUTH_BAD_TAG     (ESP_ERR_MSG_AUTH_BASE + 4)  /* forged, altered or wrong key    */
 #define ESP_ERR_MSG_AUTH_REPLAY      (ESP_ERR_MSG_AUTH_BASE + 5)  /* freshness pair not newer        */
 #define ESP_ERR_MSG_AUTH_EXHAUSTED   (ESP_ERR_MSG_AUTH_BASE + 6)  /* counter used up: new epoch needed */
+#define ESP_ERR_MSG_AUTH_WRONG_SENDER (ESP_ERR_MSG_AUTH_BASE + 7) /* sender_id != expected (unauthenticated) */
 
 typedef struct msg_auth *msg_auth_handle_t;
 
@@ -39,12 +40,25 @@ typedef struct {
 
 typedef struct {
     uint32_t accepted;
-    uint32_t bad_tag;
+    uint32_t bad_tag;            /* tag failures CLAIMING this sender: the ID is unauthenticated,
+                                    so anyone can raise it; see msg_auth_stats_t.bad_tag_total */
     uint32_t replay;
     uint32_t last_epoch;         /* freshness pair of the last accepted message */
     uint32_t last_counter;
     uint8_t  seen;               /* 0 until the first accepted message          */
 } msg_auth_peer_stats_t;
+
+/* Context-wide counters (§5.8). Fields may be appended in later versions. */
+typedef struct {
+    uint32_t bad_tag_total;      /* all BAD_TAG results, whatever sender they claimed       */
+    uint32_t wrong_sender;       /* all WRONG_SENDER results from msg_auth_verify_from()    */
+} msg_auth_stats_t;
+
+/* Verified freshness pair of an accepted message (msg_auth_verify_from). */
+typedef struct {
+    uint32_t epoch;
+    uint32_t counter;
+} msg_auth_rx_info_t;
 
 /* Create a context. Derives the purpose key into the PSA key store.
  * The installation key buffer may be wiped by the caller after return. */
@@ -71,6 +85,19 @@ esp_err_t msg_auth_verify(msg_auth_handle_t h,
                           uint8_t *sender_id,
                           const void **msg, size_t *msg_len);
 
+/* Like msg_auth_verify(), for callers that know the only acceptable sender
+ * (e.g. from the link the envelope arrived on). An envelope claiming any other
+ * sender is rejected with ESP_ERR_MSG_AUTH_WRONG_SENDER before the tag is
+ * checked, and that sender's freshness state and statistics are not touched.
+ * expected_sender must be a valid peer ID (<= max_peer_id, != my_id).
+ * On ESP_OK, *msg borrows from `in` as in msg_auth_verify(), and *info (if
+ * non-null) holds the verified freshness pair. *msg, *msg_len and *info are
+ * written only on ESP_OK. Step table: §5.4a. */
+esp_err_t msg_auth_verify_from(msg_auth_handle_t h, uint8_t expected_sender,
+                               const void *in, size_t in_len,
+                               const void **msg, size_t *msg_len,
+                               msg_auth_rx_info_t *info);
+
 /* ADMINISTRATIVE: forget one peer's freshness state (stats kept).
  * Re-opens acceptance of that peer's historical messages; see §6.4.
  * Call only from trusted local recovery logic, never on a network request. */
@@ -78,6 +105,9 @@ esp_err_t msg_auth_reset_peer(msg_auth_handle_t h, uint8_t peer_id);
 
 esp_err_t msg_auth_get_peer_stats(msg_auth_handle_t h, uint8_t peer_id,
                                   msg_auth_peer_stats_t *stats);
+
+/* Copy the context-wide counters. */
+esp_err_t msg_auth_get_stats(msg_auth_handle_t h, msg_auth_stats_t *stats);
 
 const char *msg_auth_err_to_name(esp_err_t err);
 
