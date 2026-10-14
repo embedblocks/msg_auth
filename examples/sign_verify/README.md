@@ -57,7 +57,7 @@ I (3846) sign_verify: B <- node 0: accepted 7, bad_tag (claimed) 5, replay 2, la
 I (3846) sign_verify: B <- node 2: accepted 2, bad_tag (claimed) 0, replay 0, last (1, 1)
 I (3846) sign_verify: B context: bad_tag_total 5, wrong_sender 1
 I (3846) target_checks: ---- MSG_AUTH_SPEC.md §9.3 record: copy the "9.3 |" lines ----
-I (3846) target_checks: 9.3 | ESP-IDF v6.0.3, target esp32, 2 core(s)
+I (3846) target_checks: 9.3 | ESP-IDF v6.0.3, target esp32, 2 core(s), CPU 160 MHz (latencies scale with it)
 I (3846) target_checks: 9.3 | MAC path: primary (§9.1, truncated-MAC key policy)
 I (3846) target_checks: 9.3 | HMAC driver: ESP transparent HMAC driver on the SHA accelerator (CONFIG_MBEDTLS_HARDWARE_SHA=y)
 I (3846) target_checks: 9.3 | HMAC peripheral: not present on this chip
@@ -118,7 +118,7 @@ Then the app prints B's statistics. The 5 bad tags claiming node 0 are the four 
 
 | Line | How |
 | --- | --- |
-| ESP-IDF, chip, cores, MAC path, HMAC driver, threading | from the build configuration |
+| ESP-IDF, chip, cores, CPU frequency, MAC path, HMAC driver, threading | from the build configuration; CPU frequency from the clock tree at run time |
 | HKDF / truncated-MAC policy | the contexts were created with that policy and the scenarios passed |
 | Concurrency, one key ID | 2 tasks sign with B while 2 tasks verify A's and C's streams on B with `verify_from` (every 8th envelope corrupted); A then verifies all of B's envelopes in counter order; B's statistics must match exactly |
 | `psa_crypto_init()` | called again after start-up |

@@ -1,6 +1,6 @@
 idf_component_register(
     SRCS     "sign_verify.c" "target_checks.c"
-    REQUIRES msg_auth nvs_flash esp_timer mbedtls heap
+    REQUIRES msg_auth nvs_flash esp_timer mbedtls heap esp_hw_support
 )
 
 # Report the MAC path msg_auth was built with (the same -D the component reads).

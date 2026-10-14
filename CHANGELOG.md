@@ -30,7 +30,7 @@ Additive release: `msg_auth_verify()` and every 0.1.0 behaviour are unchanged.
   `msg_auth_verify_from()`. T1–T25 unchanged.
 - `examples/sign_verify`: node C, `verify_from` scenarios including a
   relayed envelope on the wrong link, and `target_checks.c`, which measures
-  every `MSG_AUTH_SPEC.md` §9.3 row (MAC path, HMAC driver, concurrency on
+  every `MSG_AUTH_SPEC.md` §9.3 row (CPU frequency, MAC path, HMAC driver, concurrency on
   one key ID, `psa_crypto_init`, heap at create and per call, stack per
   call, latency at 0/64/512/1432 bytes) and prints it as one block.
 
@@ -52,10 +52,9 @@ Additive release: `msg_auth_verify()` and every 0.1.0 behaviour are unchanged.
 ### Verified
 - Host: T1–T33 pass on both MAC paths with ASan/UBSan (TF-PSA-Crypto from
   Mbed TLS 4.0.0).
-- ESP-IDF v6.0.3: example builds without warnings for ESP32 (both MAC
-  paths) and ESP32-S3, and passes 27/27 in Espressif's QEMU (ESP32) on both
-  paths. Hardware latency and the hardware §9.3 record are still to be
-  recorded.
+- ESP-IDF v6.0.3, hardware: `examples/sign_verify` passes 27/27 on an ESP32
+  and an ESP32-S3 board (primary MAC path, 160 MHz); the §9.3 record is
+  complete for both. Also builds for both MAC paths and passes in ESP32 QEMU.
 
 
 ## [0.1.0] - 2026-10-12

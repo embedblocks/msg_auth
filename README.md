@@ -56,9 +56,9 @@ target. Chips with a SHA accelerator use it through ESP-IDF's PSA driver.
 
 | Chip | Status |
 |---|---|
-| ESP32 | Builds (both MAC paths); example passes in Espressif's QEMU on ESP-IDF v6.0.3; hardware run to record |
+| ESP32 | **Verified** on hardware, ESP-IDF v6.0.3: example 27/27, §9.3 record complete |
 | ESP32-S2 | Expected to work |
-| ESP32-S3 | Builds; hardware run to record |
+| ESP32-S3 | **Verified** on hardware, ESP-IDF v6.0.3: example 27/27, §9.3 record complete |
 | ESP32-C3 | Expected to work |
 | ESP32-C6 | Expected to work |
 
@@ -66,10 +66,13 @@ Update this table as hardware runs are recorded: `examples/sign_verify` is
 the acceptance test, and prints the `MSG_AUTH_SPEC.md` §9.3 record.
 
 **MAC path and driver.** The default (primary) path keeps a truncated-MAC
-policy on the key; it is accepted on ESP-IDF v6.0.3 (QEMU, ESP32). HMAC runs
+policy on the key; it is accepted on ESP32 and ESP32-S3 (ESP-IDF v6.0.3), so
+the fallback is not needed there. HMAC runs
 in ESP-IDF's transparent HMAC driver on the SHA accelerator
 (`CONFIG_MBEDTLS_HARDWARE_SHA=y`, the default), not on the HMAC peripheral,
-which works only with eFuse keys.
+which works only with eFuse keys. On an ESP32-S3 at 160 MHz a sign or
+verify takes about 160–220 µs from 0 to 1432 bytes, and 310–540 µs on an
+ESP32 (`MSG_AUTH_SPEC.md` §9.3).
 
 ---
 
@@ -333,7 +336,7 @@ with its mutex, plus 24 bytes of statistics per node ID. `msg_auth_create()`
 took 224 bytes in total on ESP32 for three node IDs, PSA's key storage
 included. `sign` and `verify` allocate
 nothing in msg_auth, but ESP-IDF's HMAC driver briefly takes about 280
-bytes of heap per call and returns it. If that fails the call returns
+bytes of heap per call and returns it (each concurrent call holds its own). If that fails the call returns
 `ESP_FAIL`, never `BAD_TAG`.
 
 **Counter life.** 2³² − 1 messages per epoch: 136 years at one message a

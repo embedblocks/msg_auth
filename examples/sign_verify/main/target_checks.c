@@ -23,6 +23,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "freertos/event_groups.h"
+#include "esp_clk_tree.h"
 #include "esp_heap_caps.h"
 #include "esp_idf_version.h"
 #include "esp_log.h"
@@ -59,8 +60,13 @@ static esp_err_t sign_to_b(msg_auth_handle_t from, size_t len)
 
 static void record_build(void)
 {
-    REC("ESP-IDF %s, target %s, %d core(s)", esp_get_idf_version(), CONFIG_IDF_TARGET,
-        portNUM_PROCESSORS);
+    uint32_t cpu_hz = 0;
+    if (esp_clk_tree_src_get_freq_hz(SOC_MOD_CLK_CPU, ESP_CLK_TREE_SRC_FREQ_PRECISION_CACHED,
+                                     &cpu_hz) != ESP_OK) {
+        cpu_hz = 0;
+    }
+    REC("ESP-IDF %s, target %s, %d core(s), CPU %" PRIu32 " MHz (latencies scale with it)",
+        esp_get_idf_version(), CONFIG_IDF_TARGET, portNUM_PROCESSORS, cpu_hz / 1000000);
     REC("MAC path: %s", MAC_PATH);
 #if CONFIG_MBEDTLS_HARDWARE_SHA
     REC("HMAC driver: ESP transparent HMAC driver on the SHA accelerator "

@@ -355,7 +355,7 @@ The valid counter range per epoch is `0 … UINT32_MAX − 1` (2³² − 1 value
 
 msg_auth makes **one allocation of its own** (the context, with the mutex stored inside it) in `create`, and **none** in `sign`, `verify`, `verify_from` or the other calls. The PSA implementation may allocate internally (key slot, derivation, MAC operations); this is measured on the target (§9.3) and recorded, not assumed.
 
-On ESP-IDF 6.0.3 with `CONFIG_MBEDTLS_HARDWARE_SHA=y` (the default), ESP's transparent HMAC driver `malloc`s a block-size buffer for every MAC operation, so **each `sign` and `verify` briefly needs heap (280 bytes measured, §9.3)** and returns it. If that allocation fails, the call returns `ESP_FAIL` (a crypto failure: no `bad_tag`, no state change, §5.4 rules), never an authentication result.
+On ESP-IDF 6.0.3 with `CONFIG_MBEDTLS_HARDWARE_SHA=y` (the default), ESP's transparent HMAC driver `malloc`s a block-size buffer for every MAC operation, so **each `sign` and `verify` briefly needs heap (272–280 bytes measured, §9.3)** and returns it. Calls running at the same time each hold their own. If that allocation fails, the call returns `ESP_FAIL` (a crypto failure: no `bad_tag`, no state change, §5.4 rules), never an authentication result.
 
 ## 8. Security requirements
 
@@ -388,21 +388,26 @@ Run on the actual ESP-IDF 6.0 target before the implementation is considered fin
 
 **Which driver runs (from the ESP-IDF 6.0.3 source).** The ESP **HMAC peripheral** is not involved: it computes with keys burned into eFuse, is reached through an opaque PSA driver, and the original ESP32 does not have one. msg_auth's derived key is a volatile, transparent PSA key. With `CONFIG_MBEDTLS_HARDWARE_SHA=y` (default) ESP-IDF defines `ESP_HMAC_TRANSPARENT_DRIVER_ENABLED` and PSA dispatches HMAC to ESP's **transparent HMAC driver**, which runs HMAC on the **SHA accelerator** (`components/mbedtls/port/psa_driver/esp_mac/psa_crypto_driver_esp_hmac_transparent.c`). It supports truncated output and compares with `mbedtls_ct_memcmp`. With hardware SHA disabled, Mbed TLS's built-in software HMAC is used.
 
-Results so far. **QEMU** is Espressif's ESP32 emulator (`idf.py qemu`, qemu-xtensa esp_develop_9.2.2_20260417): it runs the real firmware, including the SHA accelerator model, so correctness, heap and stack figures are meaningful; **its latencies are not** and are not recorded.
+Results. **QEMU** is Espressif's ESP32 emulator (`idf.py qemu`, qemu-xtensa esp_develop_9.2.2_20260417): it runs the real firmware, including the SHA accelerator model, so its correctness, heap and stack figures are meaningful, but **its latencies are not** and are not recorded. Both boards ran ESP-IDF v6.0.3, the primary MAC path and the default configuration (`CONFIG_MBEDTLS_HARDWARE_SHA=y`, threading on), and passed 27/27 example scenarios. All figures are the values the example printed. The ESP32 run predates the CPU-frequency line; it used the default configuration, whose CPU clock is 160 MHz.
 
-| Check | Host (TF-PSA-Crypto / Mbed TLS 4.0.0) | ESP32, QEMU, ESP-IDF v6.0.3 | ESP32 / ESP32-S3 hardware |
-| --- | --- | --- | --- |
-| HKDF output directly into an HMAC key with the required usage policy | works only with the secret as an imported DERIVE key (§5.1 step 5, amended) | works | to record |
-| Truncated-MAC policy accepted (selects §9.1 or §9.2) | accepted; both paths pass all host tests | accepted; primary path selected. Fallback path also passes | to record |
-| HMAC driver in use | built-in software | ESP transparent HMAC driver on the SHA accelerator (`CONFIG_MBEDTLS_HARDWARE_SHA=y`) | to record (expected: same) |
-| Concurrent sign and verify from ≥ 2 tasks using the **same key ID** | T22–T24, T33 pass (pthreads) | PASS: 4 tasks (2 sign, 2 `verify_from`) on one context, 800 calls, counters distinct, statistics exact, both MAC paths | to record |
-| `psa_crypto_init()` when already initialised; failure handling | returns `PSA_SUCCESS`; failure → `ESP_FAIL` (T21) | returns `PSA_SUCCESS` | to record |
-| Heap: at `create` | — | 224 bytes (`max_peer_id` 2); 0 left after `delete` | to record |
-| Heap: per `sign` / `verify` / `verify_from` (0 from msg_auth itself) | 0 from msg_auth | peak 280 bytes during each call (PSA HMAC driver), net 0, both paths | to record |
-| Peak stack use of `sign` / `verify` / `verify_from` (1432 B) | — | primary 816 / 880 / 880 bytes; fallback 848 / 864 / 864 bytes | to record |
-| Latency of `sign` / `verify` at 0, 64, 512 and 1432 bytes | — | not meaningful in an emulator | to record |
+| Check | Host (TF-PSA-Crypto / Mbed TLS 4.0.0) | ESP32, QEMU | ESP32 board, 160 MHz (default) | ESP32-S3 board, 160 MHz |
+| --- | --- | --- | --- | --- |
+| HKDF output directly into an HMAC key with the required usage policy | works only with the secret as an imported DERIVE key (§5.1 step 5, amended) | works | works | works |
+| Truncated-MAC policy accepted (selects §9.1 or §9.2) | accepted; both paths pass all host tests | accepted; the fallback path also passes | accepted: **primary path** | accepted: **primary path** |
+| HMAC driver in use | built-in software | ESP transparent HMAC driver on the SHA accelerator | same | same (the eFuse-key HMAC peripheral is present but not used) |
+| Concurrent sign and verify from ≥ 2 tasks using the **same key ID** | T22–T24, T33 pass (pthreads) | PASS, both MAC paths | PASS: 4 tasks (2 sign, 2 `verify_from`), 800 calls in 159.3 ms, 0 failures, counters distinct, statistics exact | PASS: 4 tasks (2 sign, 2 `verify_from`), 800 calls in 97.8 ms, 0 failures, counters distinct, statistics exact |
+| `psa_crypto_init()` when already initialised; failure handling | returns `PSA_SUCCESS`; failure → `ESP_FAIL` (T21) | `PSA_SUCCESS` | `PSA_SUCCESS` | `PSA_SUCCESS` |
+| Heap: at `create` (`max_peer_id` 2) | — | 224 bytes; 0 left after `delete` | 224 bytes; 0 left after `delete` | 224 bytes; 0 left after `delete` |
+| Heap: per `sign` / `verify` / `verify_from` (0 from msg_auth itself) | 0 from msg_auth | peak 280 bytes (PSA HMAC driver), net 0 | peak 280 bytes, net 0 | peak 272 bytes, net 0 |
+| Peak stack use of `sign` / `verify` / `verify_from` (1432 B) | — | 816 / 880 / 880 bytes | 816 / 880 / 928 bytes | 880 / 944 / 944 bytes |
+| Latency `sign` / `verify` / `verify_from`, 0 B | — | not meaningful | 310 / 360 / 360 µs | 162 / 167 / 160 µs |
+| … 64 B | — | — | 323 / 364 / 364 µs | 179 / 186 / 178 µs |
+| … 512 B | — | — | 379 / 426 / 426 µs | 207 / 209 / 193 µs |
+| … 1432 B | — | — | 503 / 539 / 539 µs | 222 / 213 / 198 µs |
 
-Each hardware record states the ESP-IDF version, target chip, relevant PSA/Mbed TLS configuration and the implementation path selected; the example prints all of these.
+Latency rises only from about 160 to 220 µs (ESP32-S3) and 310 to 540 µs (ESP32) between 0 and 1432 bytes, so most of each call is fixed per-call cost (PSA key lookup, locking, the driver's allocation) rather than hashing. Per-frame authentication of a high-rate stream would pay that fixed cost on every frame; state-type traffic does not notice it.
+
+Each hardware record states the ESP-IDF version, target chip, CPU frequency (latency scales with it), relevant PSA/Mbed TLS configuration and the implementation path selected; the example prints all of these.
 
 ## 10. Code organisation and tests
 
@@ -502,7 +507,7 @@ Runs on any ESP32 board, **no Wi-Fi and no network**: msg_auth needs nothing but
 | `psa_crypto_init` when already initialised | `PSA_SUCCESS` |
 
 - Prints per-peer stats (`msg_auth_get_peer_stats`) and context stats (`msg_auth_get_stats`).
-- Then prints the **§9.3 record**: ESP-IDF version, chip, MAC path, HMAC driver, key-policy result, concurrency result, heap at create and per call (peak and net), stack per call, and latency of sign / verify / verify_from at 0, 64, 512 and 1432 bytes.
+- Then prints the **§9.3 record**: ESP-IDF version, chip, CPU frequency, MAC path, HMAC driver, key-policy result, concurrency result, heap at create and per call (peak and net), stack per call, and latency of sign / verify / verify_from at 0, 64, 512 and 1432 bytes.
 
 A networked example (nodes over `udp_link`) belongs to a separate component that depends on both msg_auth and udp_link. msg_auth, including its examples, never depends on a transport.
 
